@@ -1,0 +1,862 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AMM 交易执行 · 滑点与三明治攻击分析报告</title>
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7;
+  --surface-1: #fcfcfb;
+  --surface-2: #f4f3ef;
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted: #898781;
+  --grid: #e1e0d9;
+  --axis: #c3c2b7;
+  --border: rgba(11,11,11,0.10);
+  --series: #2a78d6;
+  --series-soft: rgba(42,120,214,0.12);
+  --good: #0ca30c;
+  --critical: #d03b3b;
+  --warning: #c27c0a;
+  --victim: #0e8a6f;
+  --invalid: #898781;
+  --band: rgba(194,124,10,0.12);
+  --band-edge: rgba(194,124,10,0.55);
+  --shadow: 0 1px 2px rgba(11,11,11,0.05), 0 4px 16px rgba(11,11,11,0.05);
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+    --page: #0d0d0d;
+    --surface-1: #1a1a19;
+    --surface-2: #232321;
+    --text-primary: #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted: #898781;
+    --grid: #2c2c2a;
+    --axis: #383835;
+    --border: rgba(255,255,255,0.10);
+    --series: #3987e5;
+    --series-soft: rgba(57,135,229,0.16);
+    --good: #27c93f;
+    --critical: #e5484d;
+    --warning: #c98500;
+    --victim: #199e70;
+    --invalid: #898781;
+    --band: rgba(217,154,31,0.10);
+    --band-edge: rgba(217,154,31,0.45);
+    --shadow: none;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d;
+  --surface-1: #1a1a19;
+  --surface-2: #232321;
+  --text-primary: #ffffff;
+  --text-secondary: #c3c2b7;
+  --text-muted: #898781;
+  --grid: #2c2c2a;
+  --axis: #383835;
+  --border: rgba(255,255,255,0.10);
+  --series: #3987e5;
+  --series-soft: rgba(57,135,229,0.16);
+  --good: #27c93f;
+  --critical: #e5484d;
+  --warning: #c98500;
+  --victim: #199e70;
+  --invalid: #898781;
+  --band: rgba(217,154,31,0.10);
+  --band-edge: rgba(217,154,31,0.45);
+  --shadow: none;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  background: var(--page);
+  color: var(--text-primary);
+  font-family: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+}
+.wrap { max-width: 1200px; margin: 0 auto; padding: 32px 20px 64px; }
+header.page { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 8px; }
+h1 { font-size: 24px; margin: 0 0 6px; letter-spacing: -0.01em; }
+.subtitle { color: var(--text-secondary); font-size: 14px; margin: 0; }
+.theme-btn {
+  flex: none; border: 1px solid var(--border); background: var(--surface-1);
+  color: var(--text-secondary); border-radius: 8px; padding: 6px 12px;
+  font-size: 13px; cursor: pointer; font-family: inherit;
+}
+.theme-btn:hover { color: var(--text-primary); }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; margin: 22px 0 8px; }
+.tile {
+  background: var(--surface-1); border: 1px solid var(--border);
+  border-radius: 12px; padding: 14px 16px; box-shadow: var(--shadow);
+}
+.tile .k { font-size: 12px; color: var(--text-muted); margin-bottom: 4px; }
+.tile .v { font-size: 22px; font-weight: 650; }
+.tile .v small { font-size: 12px; font-weight: 400; color: var(--text-muted); margin-left: 4px; }
+.v.good { color: var(--good); }
+.v.critical { color: var(--critical); }
+.v.serious { color: var(--warning); }
+section.scenario {
+  background: var(--surface-1); border: 1px solid var(--border);
+  border-radius: 14px; padding: 20px 22px; margin-top: 20px; box-shadow: var(--shadow);
+}
+section.scenario > h2 { font-size: 18px; margin: 0 0 4px; }
+.scenario .desc { color: var(--text-secondary); font-size: 13.5px; margin: 0 0 4px; }
+.meta { font-size: 12.5px; color: var(--text-muted); margin: 2px 0 14px; }
+.chart-card { background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 10px 10px 4px; }
+.legend { display: flex; flex-wrap: wrap; gap: 14px; padding: 6px 8px 10px; font-size: 12.5px; color: var(--text-secondary); }
+.legend .item { display: inline-flex; align-items: center; gap: 6px; }
+.legend svg { display: block; }
+.chart-host { position: relative; width: 100%; }
+.chart-host svg { display: block; width: 100%; height: auto; }
+.tooltip {
+  position: absolute; pointer-events: none; z-index: 5; min-width: 220px; max-width: 290px;
+  background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px;
+  padding: 10px 12px; font-size: 12.5px; box-shadow: 0 6px 24px rgba(0,0,0,0.18);
+  opacity: 0; transition: opacity 0.08s;
+}
+.tooltip.show { opacity: 1; }
+.tooltip .tt-title { font-weight: 650; margin-bottom: 2px; }
+.tooltip .tt-note { color: var(--text-muted); margin-bottom: 4px; }
+.tooltip .tt-row { display: flex; justify-content: space-between; gap: 12px; color: var(--text-secondary); }
+.tooltip .tt-row b { color: var(--text-primary); font-weight: 600; font-variant-numeric: tabular-nums; }
+.tooltip .tt-warn { margin-top: 6px; border-radius: 6px; padding: 4px 8px; font-size: 12px; }
+.tt-warn.critical { background: color-mix(in srgb, var(--critical) 12%, transparent); color: var(--critical); }
+.tt-warn.warning { background: color-mix(in srgb, var(--warning) 16%, transparent); color: var(--text-secondary); }
+.tt-warn.victim { background: color-mix(in srgb, var(--victim) 14%, transparent); color: var(--text-secondary); }
+.subhead { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 22px 0 10px; flex-wrap: wrap; }
+.subhead h3 { font-size: 15px; margin: 0; }
+.filters { display: flex; gap: 6px; }
+.filters button {
+  border: 1px solid var(--border); background: var(--surface-1); color: var(--text-secondary);
+  font-family: inherit; font-size: 12.5px; border-radius: 999px; padding: 4px 12px; cursor: pointer;
+}
+.filters button.active { background: var(--series); border-color: var(--series); color: #fff; }
+.table-scroll { overflow-x: auto; border: 1px solid var(--border); border-radius: 10px; }
+table { border-collapse: collapse; width: 100%; font-size: 12.5px; min-width: 1080px; }
+th, td { text-align: right; padding: 7px 8px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+th { color: var(--text-muted); font-weight: 550; background: var(--surface-2); position: sticky; top: 0; }
+th:first-child, td:first-child, th.l, td.l { text-align: left; }
+/* 说明列：自动布局下用 min-width 兜底，避免被 nowrap 的数字列压成一字宽 */
+th:last-child, td:last-child { text-align: left; width: 200px; min-width: 150px; }
+tbody tr:last-child td { border-bottom: none; }
+td.num, th.num { font-variant-numeric: tabular-nums; }
+td:nth-child(10) { white-space: normal; }
+tr.row-rejected { background: color-mix(in srgb, var(--critical) 6%, transparent); }
+tr.row-sandwich { background: color-mix(in srgb, var(--victim) 7%, transparent); }
+tr.row-hidden { display: none; }
+.badge { display: inline-flex; align-items: center; gap: 5px; border-radius: 999px; padding: 2px 9px; font-size: 11.5px; font-weight: 600; }
+.badge.ok { background: color-mix(in srgb, var(--good) 14%, transparent); color: var(--good); }
+.badge.rej { background: color-mix(in srgb, var(--critical) 13%, transparent); color: var(--critical); }
+.badge.inv { background: var(--surface-2); color: var(--text-muted); }
+.badge.warn { background: color-mix(in srgb, var(--warning) 20%, transparent); color: var(--text-secondary); }
+.badge.victim { background: color-mix(in srgb, var(--victim) 18%, transparent); color: var(--text-secondary); }
+.detail { font-size: 11.5px; color: var(--text-muted); white-space: normal; overflow: visible; text-overflow: clip; line-height: 1.45; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 12px; margin-top: 12px; }
+.card {
+  border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px;
+  background: var(--surface-2);
+}
+.card h4 { margin: 0 0 8px; font-size: 13.5px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.card .grid2 { display: grid; grid-template-columns: 1fr auto; gap: 3px 14px; font-size: 12.5px; }
+.card .grid2 .ck { color: var(--text-muted); }
+.card .grid2 .cv { text-align: right; font-variant-numeric: tabular-nums; }
+.cv.loss { color: var(--critical); font-weight: 650; }
+.cv.profit { color: var(--warning); font-weight: 650; }
+.cv.good { color: var(--good); font-weight: 650; }
+.chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
+.chip {
+  font-size: 12px; border: 1px solid var(--band-edge); background: var(--band);
+  border-radius: 8px; padding: 5px 10px; color: var(--text-secondary);
+}
+.chip.pattern { border-color: color-mix(in srgb, var(--victim) 55%, var(--border));
+  background: color-mix(in srgb, var(--victim) 9%, transparent); }
+.empty { color: var(--text-muted); font-size: 12.5px; padding: 10px 2px; }
+footer.method { margin-top: 28px; color: var(--text-secondary); font-size: 13px; }
+footer.method h3 { color: var(--text-primary); font-size: 15px; margin-bottom: 6px; }
+footer.method code { background: var(--surface-2); border: 1px solid var(--border); border-radius: 5px; padding: 1px 6px; font-size: 12px; }
+footer.method ul { padding-left: 20px; margin: 6px 0; }
+@media (max-width: 760px) {
+  .tiles { grid-template-columns: repeat(2, 1fr); }
+  .wrap { padding: 22px 14px 48px; }
+  section.scenario { padding: 16px 14px; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header class="page">
+    <div>
+      <h1>AMM 交易执行 · 滑点与三明治攻击分析</h1>
+      <p class="subtitle">恒定乘积做市商 x·y=k（Uniswap v2 核心模型）· 状态与定价全程 128 位精确整数，浮点仅用于展示</p>
+    </div>
+    <button class="theme-btn" id="themeBtn" type="button">🌙 深色</button>
+  </header>
+
+  <div class="tiles" id="globalTiles"></div>
+  <main id="scenarios"></main>
+
+  <footer class="method">
+    <h3>模型与口径说明</h3>
+    <ul>
+      <li><b>定价公式：</b><code>amountOut = amountInNet · reserveOut / (reserveIn + amountInNet)</code>，其中 <code>amountInNet = floor(amountIn · <span id="feeNum"></span>/10000)</code>，默认费率 <code id="feeNote"></code>。全部运算为整数向下取整。</li>
+      <li><b>手续费处理（明确口径）：</b>手续费在输入端扣除（仅 <code>amountInNet</code> 参与定价），但<b>不离开资金池</b>——输入侧储备增加的是含手续费的完整 <code>amountIn</code>，即 <code>reserveIn' = reserveIn + amountIn</code>。因此每笔成交后 <code>k' = reserveIn'·reserveOut' ≥ k</code> 严格成立，放大部分正是留存给 LP 的手续费；零费率时 <code>k' = k</code>（整数取整只会让 k 不减）。储备与金额均为 128 位无符号整数，连续小额交易不会产生浮点漂移。</li>
+      <li><b>价格冲击（price impact）：</b>成交后现货价 <code>p = reserve1/reserve0</code> 相对成交前的变动幅度，以基点（bps）计；这是交易本身推动曲线滑动的成本，与手续费无关。</li>
+      <li><b>滑点保护：</b>支持两种阈值——绝对 <code>minAmountOut</code>，或给定签名时储备快照 + 最大滑点 bps（据此重算无操纵公允报价 <code>refOut</code> 并推导 <code>floor(refOut·(1−tol))</code>）。任一阈值不满足即<b>拒绝且池状态不变</b>，报告以红色 ✕ 明确标出，绝不静默成交。</li>
+      <li><b>三明治攻击：</b>攻击者抢先同向交易扭曲价格 → 受害者在劣价成交 → 攻击者反向平仓。受害者损失 = <b>无攻击公允报价（以建仓前储备计算）− 实际输出</b>；攻击者净利 = 平仓收回 − 建仓投入（三笔手续费已含在精确报价内）。</li>
+      <li><b>异常跳变与形态识别：</b>相邻成交间现货价变动 ≥ <span id="jumpTh"></span> 标记为异常跳变；启发式检测不依赖标签——同一账户在 <span id="winTh"></span> 内以<b>相反方向</b>的两笔大额交易首尾夹着他人订单，即识别为疑似三明治（受害者被拒绝时识别为攻击未遂）。</li>
+    </ul>
+    <p class="empty" id="genAt"></p>
+  </footer>
+</div>
+
+<script id="report-data" type="application/json">__REPORT_DATA__</script>
+<script>
+(function () {
+  "use strict";
+  var DATA = JSON.parse(document.getElementById("report-data").textContent);
+
+  var root = document.documentElement;
+  var themeBtn = document.getElementById("themeBtn");
+  function currentTheme() {
+    return root.getAttribute("data-theme") ||
+      (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+  }
+  function paintThemeBtn() {
+    themeBtn.textContent = currentTheme() === "dark" ? "☀️ 浅色" : "🌙 深色";
+  }
+  themeBtn.addEventListener("click", function () {
+    root.setAttribute("data-theme", currentTheme() === "dark" ? "light" : "dark");
+    paintThemeBtn();
+    renderAll();
+  });
+  paintThemeBtn();
+
+  function fmtNum(x) {
+    if (x === null || x === undefined || isNaN(x)) return "—";
+    var abs = Math.abs(x);
+    var digits = abs >= 1000 ? 2 : abs >= 1 ? 4 : abs >= 0.01 ? 6 : 8;
+    return x.toLocaleString("zh-CN", { maximumFractionDigits: digits });
+  }
+  function fmtBps(x) {
+    if (x === null || x === undefined || isNaN(x)) return "—";
+    return x.toLocaleString("zh-CN", { maximumFractionDigits: 2 }) + " bps";
+  }
+  function fmtPct(bps) { return (bps / 100).toLocaleString("zh-CN", { maximumFractionDigits: 3 }) + "%"; }
+  function cssVar(name) {
+    return getComputedStyle(document.body).getPropertyValue(name).trim();
+  }
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+
+  // Marker semantics are shape-coded as well as color-coded (circle/X/diamond/
+  // square) so the chart never relies on hue alone.
+  function markerOf(s) {
+    if (s.status === "rejected_slippage") return s.tag === "victim" ? "rej-victim" : "rej";
+    if (s.status === "rejected_invalid") return "inv";
+    if (s.tag === "front" || s.tag === "back") return "attack";
+    if (s.tag === "victim") return "victim";
+    return "ok";
+  }
+
+  var NS = "http://www.w3.org/2000/svg";
+  var M = { top: 28, right: 22, bottom: 42, left: 66 };
+  var CH_H = 340;
+
+  function niceTicks(min, max, count) {
+    var span = max - min || Math.abs(max) || 1;
+    var step0 = span / count;
+    var mag = Math.pow(10, Math.floor(Math.log10(step0)));
+    var norm = step0 / mag;
+    var step = norm >= 5 ? 10 * mag : norm >= 2 ? 5 * mag : norm >= 1 ? 2 * mag : mag;
+    var start = Math.ceil(min / step) * step;
+    var ticks = [];
+    for (var v = start; v <= max + step * 1e-9; v += step) ticks.push(+v.toFixed(10));
+    return ticks;
+  }
+
+  function renderChart(scenario) {
+    var host = el("div", "chart-host");
+    var card = el("div", "chart-card");
+
+    var legend = el("div", "legend");
+    [
+      { label: "成交价格（" + scenario.token1 + "/" + scenario.token0 + " 现货价）", shape: "line" },
+      { label: "✓ 正常成交", shape: "dot" },
+      { label: "✕ 滑点保护拒绝（池状态不变）", shape: "x" },
+      { label: "✕ 非法请求拒绝", shape: "xg" },
+      { label: "◆ 攻击者建仓 / 平仓腿", shape: "dia-w" },
+      { label: "■ 受害者成交点", shape: "sq" },
+      { label: "疑似三明治时间窗", shape: "band" }
+    ].forEach(function (it) {
+      var item = el("span", "item");
+      var s = document.createElementNS(NS, "svg");
+      s.setAttribute("width", 18); s.setAttribute("height", 12);
+      if (it.shape === "line") {
+        var ln = document.createElementNS(NS, "line");
+        ln.setAttribute("x1", 0); ln.setAttribute("x2", 18); ln.setAttribute("y1", 6); ln.setAttribute("y2", 6);
+        ln.setAttribute("stroke", "var(--series)"); ln.setAttribute("stroke-width", 2);
+        s.appendChild(ln);
+      } else if (it.shape === "band") {
+        var rct = document.createElementNS(NS, "rect");
+        rct.setAttribute("x", 1); rct.setAttribute("y", 1); rct.setAttribute("width", 16); rct.setAttribute("height", 10);
+        rct.setAttribute("rx", 2); rct.setAttribute("fill", "var(--band)"); rct.setAttribute("stroke", "var(--band-edge)");
+        s.appendChild(rct);
+      } else if (it.shape === "dot") {
+        var c = document.createElementNS(NS, "circle");
+        c.setAttribute("cx", 9); c.setAttribute("cy", 6); c.setAttribute("r", 4);
+        c.setAttribute("fill", "var(--series)"); c.setAttribute("stroke", "var(--surface-1)"); c.setAttribute("stroke-width", 2);
+        s.appendChild(c);
+      } else {
+        var col = it.shape === "x" ? "var(--critical)" : it.shape === "xg" ? "var(--invalid)"
+          : it.shape === "dia-w" ? "var(--warning)" : "var(--victim)";
+        if (it.shape.charAt(0) === "x") {
+          [[3, 3, 15, 9], [15, 3, 3, 9]].forEach(function (a) {
+            var l = document.createElementNS(NS, "line");
+            l.setAttribute("x1", a[0]); l.setAttribute("y1", a[1]); l.setAttribute("x2", a[2]); l.setAttribute("y2", a[3]);
+            l.setAttribute("stroke", col); l.setAttribute("stroke-width", 2.4); l.setAttribute("stroke-linecap", "round");
+            s.appendChild(l);
+          });
+        } else if (it.shape === "dia-w") {
+          var d = document.createElementNS(NS, "path");
+          d.setAttribute("d", "M9 1 L16 6 L9 11 L2 6 Z");
+          d.setAttribute("fill", col); d.setAttribute("stroke", "var(--surface-1)"); d.setAttribute("stroke-width", 1.5);
+          s.appendChild(d);
+        } else {
+          var q = document.createElementNS(NS, "rect");
+          q.setAttribute("x", 3); q.setAttribute("y", 2); q.setAttribute("width", 12); q.setAttribute("height", 8); q.setAttribute("rx", 2);
+          q.setAttribute("fill", col); q.setAttribute("stroke", "var(--surface-1)"); q.setAttribute("stroke-width", 1.5);
+          s.appendChild(q);
+        }
+      }
+      item.appendChild(s);
+      item.appendChild(el("span", null, it.label));
+      legend.appendChild(item);
+    });
+    card.appendChild(legend);
+
+    var tooltip = el("div", "tooltip");
+    host.appendChild(card);
+    host.appendChild(tooltip);
+
+    var svg = document.createElementNS(NS, "svg");
+    svg.setAttribute("viewBox", "0 0 1000 " + CH_H);
+    svg.setAttribute("role", "img");
+    svg.setAttribute("aria-label", "价格随交易序号变化的折线图");
+    card.appendChild(svg);
+    host._svg = svg; host._tt = tooltip; host._scenario = scenario;
+    return host;
+  }
+
+  function drawChart(host) {
+    var svg = host._svg, tt = host._tt, scenario = host._scenario;
+    while (svg.firstChild) svg.removeChild(svg.firstChild);
+    var W = 1000, H = CH_H;
+    var steps = scenario.steps;
+    var cSeries = cssVar("--series"), cGrid = cssVar("--grid"), cAxis = cssVar("--axis"),
+      cMuted = cssVar("--text-muted"), cSurface = cssVar("--surface-1"),
+      cCritical = cssVar("--critical"), cWarning = cssVar("--warning"),
+      cVictim = cssVar("--victim"), cInvalid = cssVar("--invalid");
+
+    var pw = W - M.left - M.right, ph = H - M.top - M.bottom;
+    var prices = steps.map(function (s) { return s.price; });
+    var pmin = Math.min.apply(null, prices), pmax = Math.max.apply(null, prices);
+    var pad = (pmax - pmin || pmax * 0.02 || 1) * 0.12;
+    pmin -= pad; pmax += pad;
+    function X(i) { return M.left + (steps.length <= 1 ? pw / 2 : pw * i / (steps.length - 1)); }
+    function Y(p) { return M.top + ph * (1 - (p - pmin) / (pmax - pmin)); }
+
+    // Sandwich window bands.
+    scenario.sandwiches.forEach(function (sw, idx) {
+      var iF = steps.findIndex(function (s) { return s.seq === sw.frontSeq; });
+      var iB = steps.findIndex(function (s) { return s.seq === sw.backSeq; });
+      if (iF < 0 || iB < 0) return;
+      var x0 = X(iF) - 16, x1 = X(iB) + 16;
+      var rect = document.createElementNS(NS, "rect");
+      rect.setAttribute("x", x0); rect.setAttribute("y", M.top - 8);
+      rect.setAttribute("width", Math.max(2, x1 - x0)); rect.setAttribute("height", ph + 14);
+      rect.setAttribute("rx", 8); rect.setAttribute("fill", "var(--band)");
+      rect.setAttribute("stroke", "var(--band-edge)"); rect.setAttribute("stroke-dasharray", "4 3");
+      svg.appendChild(rect);
+      var lbl = document.createElementNS(NS, "text");
+      lbl.setAttribute("x", (x0 + x1) / 2); lbl.setAttribute("y", M.top - 12);
+      lbl.setAttribute("text-anchor", "middle"); lbl.setAttribute("font-size", 11);
+      lbl.setAttribute("fill", cMuted);
+      lbl.textContent = "疑似三明治 #" + (idx + 1) + (sw.heuristicDetected ? "（启发式已确认）" : "");
+      svg.appendChild(lbl);
+    });
+
+    niceTicks(pmin, pmax, 4).forEach(function (v) {
+      if (v < pmin || v > pmax) return;
+      var y = Y(v);
+      var gl = document.createElementNS(NS, "line");
+      gl.setAttribute("x1", M.left); gl.setAttribute("x2", W - M.right);
+      gl.setAttribute("y1", y); gl.setAttribute("y2", y);
+      gl.setAttribute("stroke", cGrid); gl.setAttribute("stroke-width", 1);
+      svg.appendChild(gl);
+      var t = document.createElementNS(NS, "text");
+      t.setAttribute("x", M.left - 8); t.setAttribute("y", y + 4);
+      t.setAttribute("text-anchor", "end"); t.setAttribute("font-size", 11);
+      t.setAttribute("fill", cMuted);
+      t.textContent = fmtNum(v);
+      svg.appendChild(t);
+    });
+
+    var axis = document.createElementNS(NS, "line");
+    axis.setAttribute("x1", M.left); axis.setAttribute("x2", W - M.right);
+    axis.setAttribute("y1", M.top + ph); axis.setAttribute("y2", M.top + ph);
+    axis.setAttribute("stroke", cAxis); axis.setAttribute("stroke-width", 1);
+    svg.appendChild(axis);
+
+    steps.forEach(function (s, i) {
+      var x = X(i);
+      var tk = document.createElementNS(NS, "line");
+      tk.setAttribute("x1", x); tk.setAttribute("x2", x);
+      tk.setAttribute("y1", M.top + ph); tk.setAttribute("y2", M.top + ph + 4);
+      tk.setAttribute("stroke", cAxis);
+      svg.appendChild(tk);
+      var t = document.createElementNS(NS, "text");
+      t.setAttribute("x", x); t.setAttribute("y", M.top + ph + 18);
+      t.setAttribute("text-anchor", "middle"); t.setAttribute("font-size", 11);
+      t.setAttribute("fill", cMuted);
+      t.textContent = "#" + s.seq;
+      svg.appendChild(t);
+    });
+
+    var yt = document.createElementNS(NS, "text");
+    yt.setAttribute("x", 14); yt.setAttribute("y", M.top - 10);
+    yt.setAttribute("font-size", 11); yt.setAttribute("fill", cMuted);
+    yt.textContent = "价格（" + scenario.token1 + "/" + scenario.token0 + "）";
+    svg.appendChild(yt);
+    var xt = document.createElementNS(NS, "text");
+    xt.setAttribute("x", W - M.right); xt.setAttribute("y", H - 6);
+    xt.setAttribute("text-anchor", "end"); xt.setAttribute("font-size", 11);
+    xt.setAttribute("fill", cMuted);
+    xt.textContent = "交易序号 →（虚线连接表示该笔未成交，价格不变）";
+    svg.appendChild(xt);
+
+    // Segments: a segment landing on a non-executed step is dashed, since no
+    // state changed there.
+    for (var i = 1; i < steps.length; i++) {
+      var seg = document.createElementNS(NS, "line");
+      seg.setAttribute("x1", X(i - 1)); seg.setAttribute("y1", Y(steps[i - 1].price));
+      seg.setAttribute("x2", X(i)); seg.setAttribute("y2", Y(steps[i].price));
+      var rejected = steps[i].status !== "executed";
+      seg.setAttribute("stroke", rejected ? cInvalid : cSeries);
+      seg.setAttribute("stroke-width", 2);
+      if (rejected) seg.setAttribute("stroke-dasharray", "4 4");
+      seg.setAttribute("stroke-linecap", "round");
+      svg.appendChild(seg);
+    }
+
+    steps.forEach(function (s, i) {
+      var x = X(i), y = Y(s.price), mk = markerOf(s);
+      if (mk === "rej" || mk === "inv" || mk === "rej-victim") {
+        if (mk === "rej-victim") {
+          var sq = document.createElementNS(NS, "rect");
+          sq.setAttribute("x", x - 7); sq.setAttribute("y", y - 7);
+          sq.setAttribute("width", 14); sq.setAttribute("height", 14); sq.setAttribute("rx", 3);
+          sq.setAttribute("fill", "none"); sq.setAttribute("stroke", cVictim); sq.setAttribute("stroke-width", 2);
+          svg.appendChild(sq);
+        }
+        var col = mk === "inv" ? cInvalid : cCritical;
+        [[-5, -5, 5, 5], [5, -5, -5, 5]].forEach(function (a) {
+          var l = document.createElementNS(NS, "line");
+          l.setAttribute("x1", x + a[0]); l.setAttribute("y1", y + a[1]);
+          l.setAttribute("x2", x + a[2]); l.setAttribute("y2", y + a[3]);
+          l.setAttribute("stroke", col); l.setAttribute("stroke-width", 2.4);
+          l.setAttribute("stroke-linecap", "round");
+          svg.appendChild(l);
+        });
+      } else if (mk === "attack" || mk === "victim") {
+        var fill = mk === "attack" ? cWarning : cVictim;
+        if (mk === "attack") {
+          var dia = document.createElementNS(NS, "path");
+          dia.setAttribute("d", "M" + x + " " + (y - 6.5) + " L" + (x + 6.5) + " " + y +
+            " L" + x + " " + (y + 6.5) + " L" + (x - 6.5) + " " + y + " Z");
+          dia.setAttribute("fill", fill);
+          dia.setAttribute("stroke", cSurface); dia.setAttribute("stroke-width", 1.5);
+          svg.appendChild(dia);
+        } else {
+          var q2 = document.createElementNS(NS, "rect");
+          q2.setAttribute("x", x - 6); q2.setAttribute("y", y - 6);
+          q2.setAttribute("width", 12); q2.setAttribute("height", 12); q2.setAttribute("rx", 2.5);
+          q2.setAttribute("fill", fill); q2.setAttribute("stroke", cSurface); q2.setAttribute("stroke-width", 1.5);
+          svg.appendChild(q2);
+        }
+      } else {
+        var c = document.createElementNS(NS, "circle");
+        c.setAttribute("cx", x); c.setAttribute("cy", y); c.setAttribute("r", 4);
+        c.setAttribute("fill", fill0());
+        c.setAttribute("stroke", cSurface); c.setAttribute("stroke-width", 2);
+        svg.appendChild(c);
+      }
+    });
+    function fill0() { return cSeries; }
+
+    var cross = document.createElementNS(NS, "line");
+    cross.setAttribute("y1", M.top); cross.setAttribute("y2", M.top + ph);
+    cross.setAttribute("stroke", cAxis); cross.setAttribute("stroke-width", 1);
+    cross.setAttribute("stroke-dasharray", "3 3"); cross.style.display = "none";
+    svg.appendChild(cross);
+    var hitDot = document.createElementNS(NS, "circle");
+    hitDot.setAttribute("r", 5.5); hitDot.setAttribute("fill", "var(--series)");
+    hitDot.setAttribute("stroke", cSurface); hitDot.setAttribute("stroke-width", 2);
+    hitDot.style.display = "none";
+    svg.appendChild(hitDot);
+    var overlay = document.createElementNS(NS, "rect");
+    overlay.setAttribute("x", M.left); overlay.setAttribute("y", M.top);
+    overlay.setAttribute("width", pw); overlay.setAttribute("height", ph);
+    overlay.setAttribute("fill", "transparent");
+    svg.appendChild(overlay);
+
+    function clientToIndex(evt) {
+      var rect = svg.getBoundingClientRect();
+      var px = (evt.clientX - rect.left) / rect.width * W;
+      if (steps.length === 1) return 0;
+      var f = (px - M.left) / pw * (steps.length - 1);
+      return Math.max(0, Math.min(steps.length - 1, Math.round(f)));
+    }
+    overlay.addEventListener("mousemove", function (evt) {
+      var i = clientToIndex(evt), s = steps[i], x = X(i);
+      cross.setAttribute("x1", x); cross.setAttribute("x2", x);
+      cross.style.display = "";
+      hitDot.setAttribute("cx", x); hitDot.setAttribute("cy", Y(s.price));
+      hitDot.style.display = "";
+      showTooltip(tt, s, evt, host);
+    });
+    overlay.addEventListener("mouseleave", function () {
+      cross.style.display = "none"; hitDot.style.display = "none";
+      tt.classList.remove("show"); tt.innerHTML = "";
+    });
+  }
+
+  function row(k, v, cls) {
+    var d = el("div", "tt-row");
+    d.appendChild(el("span", null, k));
+    d.appendChild(el("b", cls || null, v));
+    return d;
+  }
+  function showTooltip(tt, s, evt, host) {
+    tt.innerHTML = "";
+    tt.appendChild(el("div", "tt-title", "#" + s.seq + " · " + s.actor + (s.time ? " · " + s.time : "")));
+    if (s.note) tt.appendChild(el("div", "tt-note", s.note));
+    tt.appendChild(row("方向", "支付 " + s.inSymbol + " → 买入 " + s.outSymbol));
+    tt.appendChild(row("请求输入", fmtNum(s.amountInHuman) + " " + s.inSymbol));
+    if (s.status !== "rejected_invalid")
+      tt.appendChild(row("其中手续费（留存池内）", fmtNum(s.feeHuman) + " " + s.inSymbol));
+    tt.appendChild(row("实际输出", s.status === "rejected_invalid" ? "—（未成交）"
+      : fmtNum(s.amountOutHuman) + " " + s.outSymbol));
+    tt.appendChild(row("现货价 " + s.outSymbol + "/" + s.inSymbol + " 口径", fmtNum(s.price)));
+    if (s.status === "executed") {
+      tt.appendChild(row("价格冲击", fmtBps(s.impactBps)));
+      tt.appendChild(row("k 值增长（手续费累积）", fmtBps(s.kGrowthBps)));
+    }
+    if (s.slipVsRefBps !== null && s.slipVsRefBps !== undefined)
+      tt.appendChild(row("相对公允报价滑点", fmtBps(s.slipVsRefBps)));
+    if (s.refOutHuman !== null && s.refOutHuman !== undefined)
+      tt.appendChild(row("无操纵公允报价", fmtNum(s.refOutHuman) + " " + s.outSymbol));
+    if (s.minOutHuman !== null && s.minOutHuman !== undefined)
+      tt.appendChild(row("滑点保护阈值", "≥ " + fmtNum(s.minOutHuman) + " " + s.outSymbol));
+    if (s.status === "rejected_slippage") {
+      tt.appendChild(el("div", "tt-warn critical", "✕ 滑点保护拒绝：" + (s.rejectDetail || "输出低于阈值") + "；池状态不变"));
+    }
+    if (s.status === "rejected_invalid") {
+      tt.appendChild(el("div", "tt-warn critical", "✕ 非法请求：" + (s.rejectDetail || "—")));
+    }
+    if (s.tag === "front" || s.tag === "back")
+      tt.appendChild(el("div", "tt-warn warning", "◆ 三明治攻击者的" + (s.tag === "front" ? "建仓（抢先）腿" : "平仓（反向）腿")));
+    if (s.tag === "victim") {
+      var msg = s.status === "rejected_slippage"
+        ? "■ 受害目标，但滑点保护已成功拦截（零损失）"
+        : "■ 在被扭曲的价格上成交的受害者";
+      tt.appendChild(el("div", "tt-warn victim", msg));
+    }
+    tt.classList.add("show");
+    var hostRect = host.getBoundingClientRect();
+    var ttW = tt.offsetWidth, ttH = tt.offsetHeight;
+    var left = evt.clientX - hostRect.left + 14;
+    var top = evt.clientY - hostRect.top - ttH - 8;
+    if (left + ttW > hostRect.width - 8) left = evt.clientX - hostRect.left - ttW - 14;
+    if (top < 0) top = evt.clientY - hostRect.top + 14;
+    tt.style.left = left + "px";
+    tt.style.top = top + "px";
+  }
+
+  function statusBadge(s) {
+    if (s.status === "executed") return ["badge ok", "✓ 成交"];
+    if (s.status === "rejected_slippage") return ["badge rej", "✕ 滑点拒绝"];
+    return ["badge inv", "✕ 非法请求"];
+  }
+  function tagBadge(s) {
+    if (s.tag === "front") return ["badge warn", "◆ 攻击·建仓"];
+    if (s.tag === "back") return ["badge warn", "◆ 攻击·平仓"];
+    if (s.tag === "victim") return ["badge victim", "■ 受害者"];
+    return null;
+  }
+  function renderTable(scenario) {
+    var sub = el("div", "subhead");
+    sub.appendChild(el("h3", null, "交易明细"));
+    var filters = el("div", "filters");
+    [["all", "全部"], ["executed", "已成交"], ["rejected", "已拒绝"], ["sandwich", "三明治相关"]]
+      .forEach(function (f, i) {
+        var b = el("button", i === 0 ? "active" : null, f[1]);
+        b.dataset.filter = f[0];
+        b.addEventListener("click", function () {
+          filters.querySelectorAll("button").forEach(function (x) { x.classList.remove("active"); });
+          b.classList.add("active");
+          applyFilter(scenario, b.dataset.filter);
+        });
+        filters.appendChild(b);
+      });
+    sub.appendChild(filters);
+
+    var wrap = el("div", "table-scroll");
+    var table = el("table");
+    // 固定布局 + 显式列宽：防止数字列 nowrap 内容把“说明”列压成一字宽。
+    var cols = [38, 72, 104, 124, 92, 84, 170, 78, 108, 116, 126];
+    var colgroup = document.createElement("colgroup");
+    cols.forEach(function (w) {
+      var col = document.createElement("col");
+      col.style.width = w + "px";
+      colgroup.appendChild(col);
+    });
+    table.appendChild(colgroup);
+    var thead = el("thead");
+    var hr = el("tr");
+    ["#", "时间", "参与者", "方向", "输入", "手续费", "输出", "现货价", "价格冲击", "状态/标记", "说明"]
+      .forEach(function (h, i) {
+        var th = el("th", i >= 4 && i <= 8 ? "num" : (i === 0 || i >= 9 ? "l" : ""), h);
+        hr.appendChild(th);
+      });
+    thead.appendChild(hr);
+    table.appendChild(thead);
+    var tbody = el("tbody");
+    scenario.steps.forEach(function (s) {
+      var tr = el("tr");
+      tr.dataset.seq = s.seq;
+      if (s.status === "rejected_slippage" || s.status === "rejected_invalid") tr.classList.add("row-rejected");
+      if (s.tag) tr.classList.add("row-sandwich");
+      var tds = [
+        el("td", "l num", "#" + s.seq),
+        el("td", "num", s.time || "—"),
+        el("td", "l", s.actor),
+        el("td", "l", s.inSymbol + " → " + s.outSymbol),
+        el("td", "num", fmtNum(s.amountInHuman) + " " + s.inSymbol),
+        el("td", "num", s.status === "rejected_invalid" ? "—" : fmtNum(s.feeHuman)),
+        el("td", "num", s.status === "rejected_invalid" ? "—"
+          : fmtNum(s.amountOutHuman) + (s.status === "rejected_slippage" ? " " + s.outSymbol + "（未付）" : " " + s.outSymbol)),
+        el("td", "num", fmtNum(s.price)),
+        el("td", "num", s.status === "executed" ? fmtBps(s.impactBps) : "—")
+      ];
+      var st = el("td", "l");
+      var sb = statusBadge(s);
+      st.appendChild(el("span", sb[0], sb[1]));
+      var tg = tagBadge(s);
+      if (tg) { st.appendChild(document.createTextNode(" ")); st.appendChild(el("span", tg[0], tg[1])); }
+      tds.push(st);
+      var detail = el("td", "l");
+      detail.appendChild(el("div", "detail", s.rejectDetail || s.note || ""));
+      tds.push(detail);
+      tds.forEach(function (td) { tr.appendChild(td); });
+      tr.title = "原始整数单位：输入 " + s.amountInRaw + " / 输出 " + s.amountOutRaw +
+        "；成交后储备 R0=" + s.r0Raw + " R1=" + s.r1Raw;
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    wrap.appendChild(table);
+
+    var box = el("div");
+    box.appendChild(sub);
+    box.appendChild(wrap);
+    box._tbody = tbody;
+    return box;
+  }
+  function applyFilter(scenario, mode) {
+    var rows = scenario._tableEl._tbody.querySelectorAll("tr");
+    rows.forEach(function (tr) {
+      var s = scenario.steps.filter(function (x) { return String(x.seq) === tr.dataset.seq; })[0];
+      var hide = false;
+      if (mode === "executed") hide = s.status !== "executed";
+      else if (mode === "rejected") hide = s.status === "executed";
+      else if (mode === "sandwich") hide = !s.tag;
+      tr.classList.toggle("row-hidden", hide);
+    });
+  }
+
+  function renderSandwichCards(scenario) {
+    var box = el("div");
+    var sub = el("div", "subhead");
+    sub.appendChild(el("h3", null, "三明治攻击分析"));
+    box.appendChild(sub);
+    if (!scenario.sandwiches.length) {
+      box.appendChild(el("div", "empty", "本场景无三明治攻击模拟。"));
+      return box;
+    }
+    var cards = el("div", "cards");
+    scenario.sandwiches.forEach(function (sw, idx) {
+      var card = el("div", "card");
+      var h = el("h4");
+      h.appendChild(el("span", null, "攻击 #" + (idx + 1)));
+      h.appendChild(el("span", "badge warn", "◆ " + sw.attacker));
+      h.appendChild(el("span", "badge victim", "目标 " + sw.victim));
+      if (sw.victimRejected) h.appendChild(el("span", "badge ok", "✓ 受害者已被滑点保护拦截"));
+      if (sw.heuristicDetected) h.appendChild(el("span", "badge ok", "启发式检测已确认"));
+      card.appendChild(h);
+      var g = el("div", "grid2");
+      function add(k, v, cls) {
+        g.appendChild(el("div", "ck", k));
+        g.appendChild(el("div", "cv " + (cls || ""), v));
+      }
+      add("攻击者建仓投入", fmtNum(sw.frontInHuman) + " " + sw.inSymbol);
+      add("建仓换得", fmtNum(sw.frontOutHuman) + " " + sw.midSymbol);
+      add("受害者输入", fmtNum(sw.victimInHuman) + " " + sw.inSymbol);
+      add("受害者实际输出", fmtNum(sw.victimOutHuman) + " " + sw.midSymbol + (sw.victimRejected ? "（未成交）" : ""));
+      add("无攻击时公允输出", fmtNum(sw.victimFairOutHuman) + " " + sw.midSymbol);
+      add(sw.victimRejected ? "若成交本将损失（已避免）" : "受害者实际损失",
+        fmtPct(sw.victimLossBps) + (sw.victimRejected ? "" : " · " + fmtNum(sw.victimLossHuman) + " " + sw.midSymbol),
+        sw.victimRejected ? "good" : "loss");
+      add("攻击者平仓回投", fmtNum(sw.backInHuman) + " " + sw.midSymbol);
+      add("平仓收回", fmtNum(sw.backOutHuman) + " " + sw.inSymbol);
+      add("攻击者净利（两腿手续费已扣除）",
+        fmtNum(sw.attackerNetHuman) + " " + sw.inSymbol,
+        sw.attackerNetHuman > 0 ? "profit" : "good");
+      card.appendChild(g);
+      cards.appendChild(card);
+    });
+    box.appendChild(cards);
+    return box;
+  }
+
+  function renderPatterns(scenario) {
+    var box = el("div");
+    var sub = el("div", "subhead");
+    sub.appendChild(el("h3", null, "启发式形态检测（不依赖预设标签）"));
+    box.appendChild(sub);
+    if (!scenario.patterns.length) {
+      box.appendChild(el("div", "empty", "未发现反向大额夹击形态。"));
+      return box;
+    }
+    var chips = el("div", "chips");
+    scenario.patterns.forEach(function (p) {
+      chips.appendChild(el("div", "chip pattern",
+        "#" + p.frontSeq + " → #" + p.victimSeq + " → #" + p.backSeq +
+        " · " + p.actor + " 反向夹击 " + p.victim +
+        " · 建仓冲击 " + fmtPct(p.frontBps) + " / 平仓冲击 " + fmtPct(p.backBps) +
+        " · 窗口 " + p.windowSec.toFixed(0) + "s"));
+    });
+    box.appendChild(chips);
+    return box;
+  }
+
+  function renderJumps(scenario) {
+    var box = el("div");
+    var sub = el("div", "subhead");
+    sub.appendChild(el("h3", null, "短时间价格异常跳变"));
+    box.appendChild(sub);
+    if (!scenario.jumps.length) {
+      box.appendChild(el("div", "empty", "未检测到超过阈值的异常跳变。"));
+      return box;
+    }
+    var chips = el("div", "chips");
+    scenario.jumps.forEach(function (j) {
+      chips.appendChild(el("div", "chip",
+        "#" + j.fromSeq + " → #" + j.toSeq + " · " + (j.up ? "▲ 急涨 " : "▼ 急跌 ") +
+        fmtPct(j.moveBps) + " · 触发者 " + j.actor + (j.gapSeconds > 0 ? " · 间隔 " + j.gapSeconds.toFixed(0) + "s" : "")));
+    });
+    box.appendChild(chips);
+    return box;
+  }
+
+  function renderScenario(scenario) {
+    var sec = el("section", "scenario");
+    sec.appendChild(el("h2", null, scenario.name));
+    sec.appendChild(el("p", "desc", scenario.description));
+    sec.appendChild(el("div", "meta",
+      "交易对 " + scenario.token0 + "/" + scenario.token1 +
+      " · 初始储备 " + fmtNum(scenario.startR0Human) + " " + scenario.token0 + " / " +
+      fmtNum(scenario.startR1Human) + " " + scenario.token1 +
+      " · 初始价 " + fmtNum(scenario.startPrice) + " " + scenario.token1 + "/" + scenario.token0 +
+      " · 共 " + scenario.summary.totalSteps + " 笔：成交 " + scenario.summary.executed +
+      " · 滑点拒绝 " + scenario.summary.rejectedSlip + " · 非法 " + scenario.summary.rejectedInvalid +
+      " · 最大价格冲击 " + fmtPct(scenario.summary.maxImpactBps)));
+
+    var chartHost = renderChart(scenario);
+    sec.appendChild(chartHost);
+
+    var tableEl = renderTable(scenario);
+    scenario._tableEl = tableEl;
+    sec.appendChild(tableEl);
+
+    sec.appendChild(renderSandwichCards(scenario));
+    sec.appendChild(renderPatterns(scenario));
+    sec.appendChild(renderJumps(scenario));
+    return sec;
+  }
+
+  function renderAll() {
+    var host = document.getElementById("scenarios");
+    host.innerHTML = "";
+    DATA.scenarios.forEach(function (sc) {
+      var sec = renderScenario(sc);
+      host.appendChild(sec);
+      var chartHost = sec.querySelector(".chart-host");
+      chartHost._scenario = sc;
+      drawChart(chartHost);
+    });
+    renderTiles();
+  }
+
+  function renderTiles() {
+    var t = document.getElementById("globalTiles");
+    t.innerHTML = "";
+    var total = 0, executed = 0, rejected = 0, invalid = 0, maxImpact = 0, losses = 0, profit = 0;
+    DATA.scenarios.forEach(function (sc) {
+      total += sc.summary.totalSteps;
+      executed += sc.summary.executed;
+      rejected += sc.summary.rejectedSlip;
+      invalid += sc.summary.rejectedInvalid;
+      maxImpact = Math.max(maxImpact, sc.summary.maxImpactBps);
+      sc.sandwiches.forEach(function (sw) {
+        if (!sw.victimRejected) losses += sw.victimLossHuman;
+        profit += sw.attackerNetHuman;
+      });
+    });
+    function tile(k, v, cls, small) {
+      var d = el("div", "tile");
+      d.appendChild(el("div", "k", k));
+      var vv = el("div", "v" + (cls ? " " + cls : ""), v);
+      if (small) vv.appendChild(el("small", null, small));
+      d.appendChild(vv);
+      t.appendChild(d);
+    }
+    tile("成交 / 拒绝 / 非法", executed + " / " + rejected + " / " + invalid,
+      rejected > 0 ? "critical" : "good", "共 " + total + " 笔");
+    tile("滑点保护拦截", String(rejected), rejected > 0 ? "critical" : "good", "全部零状态变更");
+    tile("最大单笔价格冲击", fmtPct(maxImpact), maxImpact >= 1000 ? "serious" : null);
+    tile("受害者损失合计", fmtNum(losses) + " USDC", losses > 0 ? "serious" : "good",
+      "攻击者净利合计 " + fmtNum(profit) + " WETH");
+  }
+
+  document.getElementById("feeNote").textContent = DATA.feePct.toFixed(2) + "%（" + DATA.feeBps + " bps）";
+  document.getElementById("feeNum").textContent = (10000 - DATA.feeBps);
+  document.getElementById("jumpTh").textContent = "10%（1000 bps）";
+  document.getElementById("winTh").textContent = "5 分钟（300 秒）";
+  document.getElementById("genAt").textContent = "报告生成时间：" + DATA.generatedAt +
+    " · 数据与逻辑全部内嵌于本文件，无外部依赖、无网络请求";
+  renderAll();
+})();
+</script>
+</body>
+</html>
